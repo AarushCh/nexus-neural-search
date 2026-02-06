@@ -22,7 +22,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "arcee-ai/trinity-large-preview
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-app = FastAPI(title="FreeMe Engine v3.0 (Super Lazy)")
+app = FastAPI(title="FreeMe Engine v3.0 (Lite Edition)")
 
 # CORS Setup
 app.add_middleware(
@@ -38,7 +38,6 @@ Base.metadata.create_all(bind=engine)
 # --- 🐢 GLOBAL VARIABLES (Initially Empty) ---
 client = None
 ai_model = None
-ai_cross_encoder = None
 
 # --- 🚀 SUPER-LAZY LOADERS ---
 def get_qdrant():
@@ -46,7 +45,8 @@ def get_qdrant():
     global client
     if client is None:
         print("☁️ Connecting to Qdrant...")
-        from qdrant_client import QdrantClient # 👈 Import here to save startup time
+        from qdrant_client import QdrantClient
+        # ⚠️ Make sure QDRANT_URL starts with https:// in Render Dashboard!
         if QDRANT_URL and QDRANT_API_KEY:
             client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         else:
@@ -54,22 +54,14 @@ def get_qdrant():
     return client
 
 def get_model():
-    """Loads AI Brain ONLY when needed"""
+    """Loads ONE AI Model ONLY when needed"""
     global ai_model
     if ai_model is None:
         print("🧠 Waking up AI Brain (Loading SentenceTransformer)...")
-        from sentence_transformers import SentenceTransformer # 👈 Import here
+        from sentence_transformers import SentenceTransformer
+        # We only use the embedding model now (RAM saver)
         ai_model = SentenceTransformer("all-MiniLM-L6-v2")
     return ai_model
-
-def get_cross_encoder():
-    """Loads Reranker ONLY when needed"""
-    global ai_cross_encoder
-    if ai_cross_encoder is None:
-        print("🧠 Waking up Reranker (Loading CrossEncoder)...")
-        from sentence_transformers import CrossEncoder # 👈 Import here
-        ai_cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    return ai_cross_encoder
 
 # ----------------------------------
 
@@ -77,9 +69,6 @@ def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
-
-def normalize_score(logit):
-    return int((1 / (1 + math.exp(-logit))) * 100)
 
 def get_safe_rating(payload):
     try: val = payload.get('rating', 0); return float(val) if str(val).lower() not in ['nan', 'n/a', ''] else 5.0
@@ -129,7 +118,7 @@ class SimilarRequest(BaseModel): id: int
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "message": "Nexus Neural Engine is Running 🦅"}
+    return {"status": "online", "message": "Nexus Neural Engine is Running (Lite) 🦅"}
 
 @app.post("/login")
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -148,26 +137,26 @@ def signup(data: AuthRequest, db: Session = Depends(get_db)):
 async def recommend(req: UserRequest):
     if req.model == 'api': return get_llm_recommendations(req.text) or []
     
-    # 🚀 LAZY LOAD EVERYTHING NOW
+    # 🚀 Load ONLY the embedding model
     model = get_model()
-    cross_encoder = get_cross_encoder()
     
     hits = safe_vector_search(model.encode(req.text).tolist(), limit=50)
     if not hits: return []
     
-    pairs = [[req.text, f"{h.payload.get('title','')} {h.payload.get('description','')}"] for h in hits]
-    scores = cross_encoder.predict(pairs)
-    
+    # No Reranking (Saves 300MB RAM)
     results = []
-    for i, h in enumerate(hits):
+    for h in hits:
         item = h.payload
         item["id"] = h.id
-        rel = float(scores[i])
+        # Use Qdrant's similarity score directly
+        item["score"] = int(h.score * 100) if h.score else 0 
+        
+        # Simple Logic Boost instead of Neural Rerank
         rat = get_safe_rating(item)
-        if rat >= 8.0: rel += 2.0
-        elif rat < 5.0 and rat > 0: rel -= 2.0
-        item["score"] = normalize_score(rel)
+        if rat >= 8.0: item["score"] += 5
+        
         results.append(item)
+        
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:req.top_k]
 
@@ -176,7 +165,6 @@ async def personalized(req: PersonalizedRequest, user=Depends(get_current_user_d
     if req.model == 'api': return await recommend(UserRequest(text=req.text, top_k=req.top_k, model='api'))
     
     model = get_model()
-    cross_encoder = get_cross_encoder()
     q_client = get_qdrant()
     
     w_items = db.query(WishlistItem).filter_by(user_id=user.id).all()
@@ -191,14 +179,14 @@ async def personalized(req: PersonalizedRequest, user=Depends(get_current_user_d
     except: final_vector = model.encode(req.text).tolist()
     
     hits = safe_vector_search(final_vector, limit=50)
-    pairs = [[req.text, f"{h.payload.get('title','')} {h.payload.get('description','')}"] for h in hits]
-    scores = cross_encoder.predict(pairs)
+    
     results = []
-    for i, h in enumerate(hits):
+    for h in hits:
         item = h.payload
         item["id"] = h.id
-        item["score"] = normalize_score(float(scores[i]))
+        item["score"] = int(h.score * 100) if h.score else 0
         results.append(item)
+        
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:req.top_k]
 
