@@ -6,9 +6,6 @@ from sqlalchemy.orm import Session
 from backend.database import Base, engine, SessionLocal
 from backend.models import User, WishlistItem
 from backend.auth import get_current_user_db, login_user, hash_password
-from qdrant_client import QdrantClient
-# We import these but DON'T initialize them yet
-from sentence_transformers import SentenceTransformer, CrossEncoder 
 import uvicorn
 import math
 import requests
@@ -25,17 +22,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "arcee-ai/trinity-large-preview
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-print("🦅 FreeMe Neural Core Starting...")
-
-# 1. DATABASE CONNECTION
-if QDRANT_URL and QDRANT_API_KEY:
-    print("☁️ CONNECTING TO QDRANT CLOUD...")
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-else:
-    print("📁 USING LOCAL STORAGE...")
-    client = QdrantClient(path="qdrant_storage", force_disable_check_same_thread=True)
-
-app = FastAPI(title="FreeMe Engine v3.0")
+app = FastAPI(title="FreeMe Engine v3.0 (Super Lazy)")
 
 # CORS Setup
 app.add_middleware(
@@ -48,24 +35,39 @@ app.add_middleware(
 
 Base.metadata.create_all(bind=engine)
 
-# --- 🚀 LAZY LOADING (The Fix) ---
-# We use global variables set to None initially
+# --- 🐢 GLOBAL VARIABLES (Initially Empty) ---
+client = None
 ai_model = None
 ai_cross_encoder = None
 
+# --- 🚀 SUPER-LAZY LOADERS ---
+def get_qdrant():
+    """Connects to Database ONLY when needed"""
+    global client
+    if client is None:
+        print("☁️ Connecting to Qdrant...")
+        from qdrant_client import QdrantClient # 👈 Import here to save startup time
+        if QDRANT_URL and QDRANT_API_KEY:
+            client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        else:
+            client = QdrantClient(path="qdrant_storage", force_disable_check_same_thread=True)
+    return client
+
 def get_model():
-    """Loads the model ONLY when needed"""
+    """Loads AI Brain ONLY when needed"""
     global ai_model
     if ai_model is None:
         print("🧠 Waking up AI Brain (Loading SentenceTransformer)...")
+        from sentence_transformers import SentenceTransformer # 👈 Import here
         ai_model = SentenceTransformer("all-MiniLM-L6-v2")
     return ai_model
 
 def get_cross_encoder():
-    """Loads the encoder ONLY when needed"""
+    """Loads Reranker ONLY when needed"""
     global ai_cross_encoder
     if ai_cross_encoder is None:
         print("🧠 Waking up Reranker (Loading CrossEncoder)...")
+        from sentence_transformers import CrossEncoder # 👈 Import here
         ai_cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return ai_cross_encoder
 
@@ -84,7 +86,9 @@ def get_safe_rating(payload):
     except: return 5.0
 
 def safe_vector_search(vector, limit=50):
-    try: return client.query_points(collection_name="freeme_collection", query=vector, limit=limit).points
+    try: 
+        q_client = get_qdrant()
+        return q_client.query_points(collection_name="freeme_collection", query=vector, limit=limit).points
     except Exception as e:
         print(f"Vector Search Error: {e}")
         return []
@@ -108,7 +112,6 @@ def get_llm_recommendations(query):
         titles = json.loads(match.group())
         results = []
         for t in titles:
-            # Lazy load model here
             model = get_model()
             hits = safe_vector_search(model.encode(str(t)).tolist(), limit=1)
             if hits:
@@ -145,7 +148,7 @@ def signup(data: AuthRequest, db: Session = Depends(get_db)):
 async def recommend(req: UserRequest):
     if req.model == 'api': return get_llm_recommendations(req.text) or []
     
-    # 🚀 LAZY LOAD CALLED HERE
+    # 🚀 LAZY LOAD EVERYTHING NOW
     model = get_model()
     cross_encoder = get_cross_encoder()
     
@@ -172,13 +175,14 @@ async def recommend(req: UserRequest):
 async def personalized(req: PersonalizedRequest, user=Depends(get_current_user_db), db: Session = Depends(get_db)):
     if req.model == 'api': return await recommend(UserRequest(text=req.text, top_k=req.top_k, model='api'))
     
-    model = get_model() # Lazy load
-    cross_encoder = get_cross_encoder() # Lazy load
+    model = get_model()
+    cross_encoder = get_cross_encoder()
+    q_client = get_qdrant()
     
     w_items = db.query(WishlistItem).filter_by(user_id=user.id).all()
     if not w_items: return await recommend(UserRequest(text=req.text, top_k=req.top_k))
     try:
-        points = client.retrieve("freeme_collection", ids=[i.media_id for i in w_items], with_vectors=True)
+        points = q_client.retrieve("freeme_collection", ids=[i.media_id for i in w_items], with_vectors=True)
         vectors = [p.vector for p in points if p.vector]
         if not vectors: raise Exception
         avg_taste = [sum(col)/len(col) for col in zip(*vectors)]
@@ -200,7 +204,8 @@ async def personalized(req: PersonalizedRequest, user=Depends(get_current_user_d
 
 @app.post("/similar")
 def similar(req: SimilarRequest):
-    tgt = client.retrieve("freeme_collection", ids=[req.id], with_vectors=True)
+    q_client = get_qdrant()
+    tgt = q_client.retrieve("freeme_collection", ids=[req.id], with_vectors=True)
     if not tgt: return []
     hits = safe_vector_search(tgt[0].vector, limit=15)
     return [{**h.payload, 'id': h.id, 'score': 95} for h in hits if h.id!=req.id][:4]
@@ -220,9 +225,10 @@ def rem_w(mid: int, u=Depends(get_current_user_db), db: Session = Depends(get_db
 
 @app.get("/wishlist")
 def get_w(u=Depends(get_current_user_db), db: Session = Depends(get_db)):
+    q_client = get_qdrant()
     ids = [i.media_id for i in db.query(WishlistItem).filter_by(user_id=u.id).all()]
     if not ids: return []
-    try: return [{**p.payload, 'id': p.id} for p in client.retrieve("freeme_collection", ids=ids)]
+    try: return [{**p.payload, 'id': p.id} for p in q_client.retrieve("freeme_collection", ids=ids)]
     except: return []
 
 if __name__ == "__main__":
