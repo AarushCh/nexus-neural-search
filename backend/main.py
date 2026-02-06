@@ -10,23 +10,23 @@ import requests
 import json
 import re
 import os
+import time
 from dotenv import load_dotenv
 
 # --- LOAD ENV VARIABLES ---
 load_dotenv()
 
-HF_TOKEN = os.environ.get("HF_TOKEN") 
+HF_TOKEN = os.environ.get("HF_TOKEN")
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
-# 🚨 UPDATED URL: Using the new 'router' endpoint
-HF_API_URL = "https://router.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+# 🚨 USING THE STANDARD STABLE ENDPOINT
+HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "arcee-ai/trinity-large-preview:free")
 
-app = FastAPI(title="FreeMe Engine (Ultra-Lite)")
+app = FastAPI(title="FreeMe Engine (Robust API Mode)")
 
-# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,44 +37,66 @@ app.add_middleware(
 
 Base.metadata.create_all(bind=engine)
 
-# --- 🧠 HELPER FUNCTIONS (API BASED) ---
-
+# --- 🧠 ROBUST EMBEDDING FUNCTION ---
 def get_embedding(text):
     """
-    Asks HuggingFace to calculate vector.
+    Retries up to 3 times if HuggingFace is 'Loading'.
+    Prints EXACT error if it fails.
     """
     if not HF_TOKEN:
-        print("❌ ERROR: Missing HF_TOKEN variable in Render")
+        print("❌ CRITICAL: HF_TOKEN is missing in Render Environment!")
         return [0.0] * 384
+
+    payload = {"inputs": text, "options": {"wait_for_model": True}}
     
-    try:
-        response = requests.post(
-            HF_API_URL,
-            headers={"Authorization": f"Bearer {HF_TOKEN}"},
-            json={"inputs": text, "options": {"wait_for_model": True}},
-            timeout=10
-        )
-        if response.status_code != 200:
-            print(f"HF API Error: {response.text}")
-            return [0.0] * 384
-        return response.json()
-    except Exception as e:
-        print(f"Embedding Connection Error: {e}")
-        return [0.0] * 384
+    for attempt in range(3): # Try 3 times
+        try:
+            response = requests.post(
+                HF_API_URL,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                json=payload,
+                timeout=10
+            )
+            
+            # 1. Success
+            if response.status_code == 200:
+                data = response.json()
+                # Check if we got a list of floats (the vector)
+                if isinstance(data, list) and isinstance(data[0], float):
+                    return data
+                # Sometimes it returns a list of list
+                if isinstance(data, list) and isinstance(data[0], list):
+                    return data[0]
+            
+            # 2. Model Loading (Wait and Retry)
+            if response.status_code == 503:
+                print(f"⚠️ Model Loading... Waiting {data.get('estimated_time', 2)}s")
+                time.sleep(data.get('estimated_time', 2))
+                continue
+            
+            # 3. Other Errors (Print them!)
+            print(f"❌ HF API Error ({response.status_code}): {response.text}")
+            break # Don't retry 400/401 errors
+            
+        except Exception as e:
+            print(f"❌ Connection Error: {e}")
+            break
+
+    # If all retries fail, return Zero Vector (This causes the 'Saiki' bug)
+    print("⚠️ FAILED to get embedding. Returning Zero Vector.")
+    return [0.0] * 384
 
 def get_qdrant():
     from qdrant_client import QdrantClient
-    # This will crash if URL is 'ttps://...'
-    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    # Ensure URL is https://
+    url = QDRANT_URL
+    if url and url.startswith("ttps://"): url = url.replace("ttps://", "https://")
+    return QdrantClient(url=url, api_key=QDRANT_API_KEY)
 
 def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
-
-def get_safe_rating(payload):
-    try: val = payload.get('rating', 0); return float(val) if str(val).lower() not in ['nan', 'n/a', ''] else 5.0
-    except: return 5.0
 
 def safe_vector_search(vector, limit=50):
     try: 
@@ -104,6 +126,7 @@ def get_llm_recommendations(query):
         
         results = []
         for t in titles:
+            # THIS was failing before. Now it will print why.
             vector = get_embedding(str(t))
             hits = safe_vector_search(vector, limit=1)
             if hits:
@@ -116,7 +139,6 @@ def get_llm_recommendations(query):
         print(f"LLM Error: {e}")
         return None
 
-# --- ROUTES ---
 class UserRequest(BaseModel): text: str; top_k: int = 12; model: str = "internal"
 class PersonalizedRequest(BaseModel): text: str; top_k: int = 12; model: str = "internal"
 class AuthRequest(BaseModel): username: str; email: str; password: str
@@ -124,7 +146,7 @@ class SimilarRequest(BaseModel): id: int
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "message": "Nexus Neural Engine is Running (Ultra-Lite) 🦅"}
+    return {"status": "online", "message": "Nexus Neural Engine v4.0 (Robust)"}
 
 @app.post("/login")
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -145,15 +167,12 @@ def recommend(req: UserRequest):
     
     vector = get_embedding(req.text)
     hits = safe_vector_search(vector, limit=50)
-    if not hits: return []
     
     results = []
     for h in hits:
         item = h.payload
         item["id"] = h.id
         item["score"] = int(h.score * 100) if h.score else 0 
-        rat = get_safe_rating(item)
-        if rat >= 8.0: item["score"] += 5
         results.append(item)
         
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -217,4 +236,5 @@ def get_w(u=Depends(get_current_user_db), db: Session = Depends(get_db)):
     except: return []
 
 if __name__ == "__main__":
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)), reload=True)
+    import uvicorn
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=10000, reload=True)
